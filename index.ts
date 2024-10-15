@@ -435,41 +435,6 @@ app.get("/orderbook/:stockSymbol", (req: any, res: any) => {
   return res.json({ orderbook });
 });
 
-// Mint fresh tokens for a user
-app.post("/trade/mint", (req: any, res: any) => {
-  const {
-    userId,
-    stockSymbol,
-    quantity,
-  }: { userId: string; stockSymbol: string; quantity: number } = req.body;
-
-  if (!INR_BALANCES[userId]) {
-    return res.status(404).json({ error: "User not found" });
-  }
-
-  for (const user in STOCK_BALANCES) {
-    if (STOCK_BALANCES[user][stockSymbol]) {
-      return res
-        .status(400)
-        .json({ error: "Symbol dosen't exists, Please create a new one" });
-    }
-  }
-
-  if (!STOCK_BALANCES[userId]) {
-    STOCK_BALANCES[userId] = {};
-  }
-
-  if (!STOCK_BALANCES[userId][stockSymbol]) {
-    STOCK_BALANCES[userId][stockSymbol] = {
-      yes: { quantity: 0, locked: 0 },
-      no: { quantity: 0, locked: 0 },
-    };
-  }
-
-  STOCK_BALANCES[userId][stockSymbol].yes.quantity += quantity;
-  return res.json({ message: "Tokens minted", STOCK_BALANCES });
-});
-
 // Server setup
 app.listen(4000, () => {
   console.log("Server is running on port 4000");
