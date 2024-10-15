@@ -1,12 +1,8 @@
-Here’s the README formatted specifically for GitHub:
-
----
-
 # Probo v0
 
 ## SuperLabs Assignment - Probo v0
 
-Probo v0 is a basic reverse engineering project that simulates the core functionalities of the Probo platform. It uses Node.js and an Express server to handle stock options and INR balances, with a focus on reducing latency by storing data in memory.
+Probo v0 is a basic reverse engineering project that simulates the core functionalities of the Probo platform. It uses Node.js and an Express server to handle betting on probabity of any event happening.
 
 ## Technology Stack
 
