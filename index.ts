@@ -1,9 +1,23 @@
 import express from "express";
 import cors from "cors";
+import { createClient } from "redis";
+import { Request, Response } from "express";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+const client = createClient();
+const connectToRedis = async () => {
+  await client.connect();
+  console.log("Connected to Redis 🔥..");
+  // client.configSet("appendonly", "yes");
+};
+connectToRedis();
+
+client.on("error", (err) => {
+  console.log("Error " + err);
+});
 
 interface INRBalances {
   [userId: string]: {
@@ -89,16 +103,21 @@ const STOCK_BALANCES: StockBalances = {
 const ORDERBOOK: Orderbook = {};
 
 // Create a new user with default 0  balance
-app.post("/user/create/:id", (req: any, res: any) => {
-  const id = req.params.id;
-  const userId = "user" + id;
-  if (INR_BALANCES[userId]) {
-    return res.status(400).json({ error: "User already exists" });
-  }
+app.post(
+  "/user/create/:userId",
+  async (req: Request, res: Response): Promise<any> => {
+    const userId: string = req.params.userId;
+    if (INR_BALANCES[userId]) {
+      res.status(400).json({ error: "User already exists" });
+      return;
+    }
 
-  INR_BALANCES[userId] = { balance: 0, locked: 0 };
-  return res.json({ message: "User created", INR_BALANCES });
-});
+    INR_BALANCES[userId] = { balance: 0, locked: 0 };
+
+    await client.lPush("users", JSON.stringify(INR_BALANCES));
+    return res.json({ message: "User created", INR_BALANCES });
+  }
+);
 
 // Create a new stock symbol with default balances
 app.post("/symbol/create/:stockSymbol", (req: any, res: any) => {
@@ -170,8 +189,43 @@ app.get("/balance/stock/:userId", (req: any, res: any) => {
 
 // Yes Stock Options
 
+function mintStocks(
+  userId: string,
+  stockSymbol: string,
+  sellerId: string,
+  price: number,
+  stockOption: "yes" | "no",
+  availableQuantity: number
+) {
+  const oppositeStockOption = stockOption === "yes" ? "no" : "yes";
+  const correspondingPrice = 10 - price;
+
+  STOCK_BALANCES[sellerId][stockSymbol][oppositeStockOption].quantity +=
+    availableQuantity;
+  STOCK_BALANCES[userId][stockSymbol][stockOption].quantity +=
+    availableQuantity;
+  INR_BALANCES[userId].balance -= availableQuantity * price;
+  INR_BALANCES[sellerId].locked -= availableQuantity * correspondingPrice;
+}
+
+function swapStocks(
+  userId: string,
+  stockSymbol: string,
+  sellerId: string,
+  price: number,
+  stockOption: "yes" | "no",
+  availableQuantity: number
+) {
+  STOCK_BALANCES[sellerId][stockSymbol][stockOption].locked -=
+    availableQuantity;
+  STOCK_BALANCES[userId][stockSymbol][stockOption].quantity +=
+    availableQuantity;
+  INR_BALANCES[userId].balance -= availableQuantity * price;
+  INR_BALANCES[sellerId].balance += availableQuantity * price;
+}
+
 // Place a buy order for 'yes' options
-app.post("/order/buy", (req: any, res: any) => {
+app.post("/order/buy", async (req: any, res: any) => {
   const {
     userId,
     stockSymbol,
@@ -234,21 +288,37 @@ app.post("/order/buy", (req: any, res: any) => {
 
         if (seller.type === "minted") {
           // mint the required tokens
-          STOCK_BALANCES[sellerId][stockSymbol][oppositeStockOption].quantity +=
-            availableQuantity;
-          STOCK_BALANCES[userId][stockSymbol][stockOption].quantity +=
-            availableQuantity;
-          INR_BALANCES[userId].balance -= availableQuantity * price;
-          INR_BALANCES[sellerId].locked -=
-            availableQuantity * correspondingPrice;
+          mintStocks(
+            userId,
+            stockSymbol,
+            sellerId,
+            price,
+            stockOption,
+            availableQuantity
+          );
+          // STOCK_BALANCES[sellerId][stockSymbol][oppositeStockOption].quantity +=
+          //   availableQuantity;
+          // STOCK_BALANCES[userId][stockSymbol][stockOption].quantity +=
+          //   availableQuantity;
+          // INR_BALANCES[userId].balance -= availableQuantity * price;
+          // INR_BALANCES[sellerId].locked -=
+          //   availableQuantity * correspondingPrice;
         } else {
           // regular (selling order)
-          STOCK_BALANCES[sellerId][stockSymbol][stockOption].quantity -=
-            availableQuantity;
-          STOCK_BALANCES[userId][stockSymbol][stockOption].quantity +=
-            availableQuantity;
-          INR_BALANCES[userId].balance -= availableQuantity * price;
-          INR_BALANCES[sellerId].balance += availableQuantity * price;
+          swapStocks(
+            userId,
+            stockSymbol,
+            sellerId,
+            price,
+            stockOption,
+            availableQuantity
+          );
+          // STOCK_BALANCES[sellerId][stockSymbol][stockOption].quantity -=
+          //   availableQuantity;
+          // STOCK_BALANCES[userId][stockSymbol][stockOption].quantity +=
+          //   availableQuantity;
+          // INR_BALANCES[userId].balance -= availableQuantity * price;
+          // INR_BALANCES[sellerId].balance += availableQuantity * price;
         }
 
         requiredQuantity -= availableQuantity;
@@ -260,6 +330,20 @@ app.post("/order/buy", (req: any, res: any) => {
           break;
         }
       }
+    }
+
+    try {
+      await client.lPush(
+        "ORDERBOOK",
+        JSON.stringify({
+          stockSymbol: stockSymbol,
+          ORDERBOOK: ORDERBOOK[stockSymbol],
+        })
+      );
+      console.log("sent the updated orderbook to queue");
+    } catch (error) {
+      console.error("Error sending the updated orderbook to queue", error);
+      return res.status(500).json({ error: "Error processing the order" });
     }
 
     return res.json({
@@ -283,23 +367,39 @@ app.post("/order/buy", (req: any, res: any) => {
           const availableQuantity = Math.min(seller.quantity, requiredQuantity);
 
           if (seller.type === "minted") {
+            mintStocks(
+              userId,
+              stockSymbol,
+              sellerId,
+              price,
+              stockOption,
+              availableQuantity
+            );
             // mint the required tokens
-            STOCK_BALANCES[sellerId][stockSymbol][
-              oppositeStockOption
-            ].quantity += availableQuantity;
-            STOCK_BALANCES[userId][stockSymbol][stockOption].quantity +=
-              availableQuantity;
-            INR_BALANCES[userId].balance -= availableQuantity * price;
-            INR_BALANCES[sellerId].locked -=
-              availableQuantity * correspondingPrice;
+            // STOCK_BALANCES[sellerId][stockSymbol][
+            //   oppositeStockOption
+            // ].quantity += availableQuantity;
+            // STOCK_BALANCES[userId][stockSymbol][stockOption].quantity +=
+            //   availableQuantity;
+            // INR_BALANCES[userId].balance -= availableQuantity * price;
+            // INR_BALANCES[sellerId].locked -=
+            //   availableQuantity * correspondingPrice;
           } else {
             // regular (selling order)
-            STOCK_BALANCES[sellerId][stockSymbol][stockOption].locked -=
-              availableQuantity;
-            STOCK_BALANCES[userId][stockSymbol][stockOption].quantity +=
-              availableQuantity;
-            INR_BALANCES[userId].balance -= availableQuantity * price;
-            INR_BALANCES[sellerId].balance += availableQuantity * price;
+            swapStocks(
+              userId,
+              stockSymbol,
+              sellerId,
+              price,
+              stockOption,
+              availableQuantity
+            );
+            // STOCK_BALANCES[sellerId][stockSymbol][stockOption].locked -=
+            //   availableQuantity;
+            // STOCK_BALANCES[userId][stockSymbol][stockOption].quantity +=
+            //   availableQuantity;
+            // INR_BALANCES[userId].balance -= availableQuantity * price;
+            // INR_BALANCES[sellerId].balance += availableQuantity * price;
           }
 
           if (seller.quantity < requiredQuantity) {
@@ -354,11 +454,25 @@ app.post("/order/buy", (req: any, res: any) => {
     INR_BALANCES[userId].balance -= requiredQuantity * price;
   }
 
+  try {
+    await client.lPush(
+      "ORDERBOOK",
+      JSON.stringify({
+        stockSymbol: stockSymbol,
+        ORDERBOOK: ORDERBOOK[stockSymbol],
+      })
+    );
+    console.log("sent the updated orderbook to queue");
+  } catch (error) {
+    console.error("Error sending the updated orderbook to queue", error);
+    return res.status(500).json({ error: "Error processing the order" });
+  }
+
   return res.json({ message: "Buy order placed", ORDERBOOK, INR_BALANCES });
 });
 
 // Place a sell order for 'yes' options
-app.post("/order/sell", (req: any, res: any) => {
+app.post("/order/sell", async (req: any, res: any) => {
   const {
     userId,
     stockSymbol,
@@ -422,7 +536,24 @@ app.post("/order/sell", (req: any, res: any) => {
   STOCK_BALANCES[userId][stockSymbol][stockOption].quantity -= quantity;
   STOCK_BALANCES[userId][stockSymbol][stockOption].locked += quantity;
 
-  return res.json({ message: "Sell order placed", ORDERBOOK });
+  try {
+    await client.lPush(
+      "ORDERBOOK",
+      JSON.stringify({
+        stockSymbol: stockSymbol,
+        ORDERBOOK: ORDERBOOK[stockSymbol],
+      })
+    );
+    console.log("sent the updated orderbook to queue");
+  } catch (error) {
+    console.error("Error sending the updated orderbook to queue", error);
+    return res.status(500).json({ error: "Error processing the order" });
+  }
+
+  return res.json({
+    message: "Sell order placed",
+    ORDERBOOK,
+  });
 });
 
 // View orderbook for a stock symbol
@@ -435,7 +566,43 @@ app.get("/orderbook/:stockSymbol", (req: any, res: any) => {
   return res.json({ orderbook });
 });
 
-// Server setup
-app.listen(4000, () => {
-  console.log("Server is running on port 4000");
+// mint stocks
+
+app.post("/trade/mint", (req: any, res: any) => {
+  const { userId, stockSymbol, quantity } = req.body;
+
+  if (!INR_BALANCES[userId]) {
+    return res.status(404).json({ error: "User not found" });
+  }
+
+  if (!STOCK_BALANCES[userId]) {
+    STOCK_BALANCES[userId] = {};
+  }
+
+  if (!STOCK_BALANCES[userId][stockSymbol]) {
+    STOCK_BALANCES[userId][stockSymbol] = {
+      yes: { quantity: 0, locked: 0 },
+      no: { quantity: 0, locked: 0 },
+    };
+  }
+
+  STOCK_BALANCES[userId][stockSymbol].yes.quantity += quantity;
+  STOCK_BALANCES[userId][stockSymbol].yes.locked += quantity;
+  INR_BALANCES[userId].balance -= quantity * 10;
+
+  return res.json({ message: "Stocks minted", STOCK_BALANCES, INR_BALANCES });
 });
+
+// Server setup
+
+async function startServer() {
+  try {
+    app.listen(4000, () => {
+      console.log("Server is running on port 4000 🔥..");
+    });
+  } catch (error) {
+    throw new Error("Error connecting to Redis");
+  }
+}
+
+startServer();
